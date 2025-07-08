@@ -1,0 +1,17 @@
+{
+  "name": "xhsqrcode",
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "hono": "^4.8.4",
+    "playwright": "^1.53.2",
+    "playwright-extra": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
