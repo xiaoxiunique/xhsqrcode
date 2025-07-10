@@ -1,8 +1,50 @@
 import { Hono } from "hono";
 import { chromium } from "playwright-extra";
-import { BrowserContext, Page } from "playwright";
+import { Browser, BrowserContext, Page, Route, Response } from "playwright";
 
 const app = new Hono();
+
+// 全局浏览器实例
+let globalBrowserInstance: Browser | null = null;
+
+// 初始化全局浏览器实例
+async function initGlobalBrowser() {
+  if (!globalBrowserInstance) {
+    globalBrowserInstance = await chromium.launch({
+      headless: false,
+      devtools: false,
+      args: [
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-site-isolation-trials",
+        "--disable-notifications",
+        "--disable-popup-blocking",
+        "--enable-network-logging",
+      ],
+    });
+    console.log("全局浏览器实例已初始化");
+  }
+  return globalBrowserInstance;
+}
+
+// 确保服务关闭时清理浏览器资源
+process.on('SIGINT', async () => {
+  if (globalBrowserInstance) {
+    console.log("正在关闭全局浏览器实例...");
+    await globalBrowserInstance.close();
+    globalBrowserInstance = null;
+  }
+  process.exit();
+});
+
+process.on('SIGTERM', async () => {
+  if (globalBrowserInstance) {
+    console.log("正在关闭全局浏览器实例...");
+    await globalBrowserInstance.close();
+    globalBrowserInstance = null;
+  }
+  process.exit();
+});
 
 // 存储浏览器会话和状态
 const sessions = new Map<
@@ -27,29 +69,19 @@ function generateNonce(): string {
 
 // 初始化浏览器会话
 async function initBrowserSession(nonce: string) {
-  const browser = await chromium.launchPersistentContext(
-    `./dist/browser_${nonce}`,
-    {
-      headless: true,
-      acceptDownloads: true,
-      devtools: false,
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      args: [
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-site-isolation-trials",
-        "--disable-notifications",
-        "--disable-popup-blocking",
-        "--enable-network-logging",
-      ],
-    }
-  );
+  // 使用全局浏览器实例
+  const browserInstance = await initGlobalBrowser();
+  
+  const browser = await browserInstance.newContext({
+    acceptDownloads: true,
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  });
 
   const page = await browser.newPage();
 
   // 设置路由拦截来禁用 CSS、图片和字体加载
-  await page.route("**/*", (route) => {
+  await page.route("**/*", (route: Route) => {
     const resourceType = route.request().resourceType();
     if (["stylesheet", "image", "font"].includes(resourceType)) {
       route.abort();
@@ -70,7 +102,7 @@ async function initBrowserSession(nonce: string) {
   sessions.set(nonce, session);
 
   // 监听二维码创建响应
-  page.on("response", async (response) => {
+  page.on("response", async (response: Response) => {
     if (["xhr", "fetch"].includes(response.request().resourceType())) {
       if (response.url().includes("/api/sns/web/v1/login/qrcode/create")) {
         const res = await response.json();
@@ -92,7 +124,7 @@ async function initBrowserSession(nonce: string) {
 
   // 1分钟后自动关闭
   session.timer = setTimeout(async () => {
-    await browser.close();
+    await browser.close(); // 只关闭context，不关闭browserInstance
     sessions.delete(nonce);
     console.log(`Session ${nonce} auto-closed after 1 minute`);
   }, 60000);
@@ -141,92 +173,37 @@ app.get("/qrcode", async (c) => {
   }
 });
 
-// 接口1.1: SSE 长连接版本 - 获取二维码并等待登录
-app.get('/qrcode/stream', async (c) => {
-  const nonce = generateNonce()
+// 接口1.2: 通过nonce手动关闭browser
+app.get("/close/:nonce", async (c) => {
+  const nonce = c.req.param("nonce");
+  const session = sessions.get(nonce);
 
-  // 设置 SSE 响应头
-  c.header('Content-Type', 'text/event-stream')
-  c.header('Cache-Control', 'no-cache')
-  c.header('Connection', 'keep-alive')
-  c.header('Access-Control-Allow-Origin', '*')
+  if (!session) {
+    return c.json({
+      code: 0,
+      data: {
+        error: "Session not found or already closed",
+      },
+      message: "Session not found or already closed",
+    }, 404);
+  }
 
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder()
+  // 清理定时器并关闭浏览器
+  if (session.timer) {
+    clearTimeout(session.timer);
+  }
+  
+  await session.browser.close();
+  sessions.delete(nonce);
 
-      const sendEvent = (event: string, data: any) => {
-        const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-        controller.enqueue(encoder.encode(message))
-      }
-
-      // 初始化浏览器会话
-      initBrowserSession(nonce).then(async (session) => {
-        // 发送连接成功事件
-        sendEvent('connected', { nonce, message: 'Browser session initialized' })
-
-        // 等待二维码 URL
-        let attempts = 0
-        while (!session.qrCodeUrl && attempts < 50) {
-          await new Promise(resolve => setTimeout(resolve, 200))
-          attempts++
-        }
-
-        if (!session.qrCodeUrl) {
-          sendEvent('error', { error: 'Failed to get QR code URL' })
-          await session.browser.close()
-          sessions.delete(nonce)
-          controller.close()
-          return
-        }
-
-        // 发送二维码 URL
-        sendEvent('qrcode', { qrCodeUrl: session.qrCodeUrl })
-
-        // 监听登录状态变化
-        const checkLogin = setInterval(async () => {
-          if (session.isLoggedIn) {
-            clearInterval(checkLogin)
-
-            // 清理定时器
-            if (session.timer) {
-              clearTimeout(session.timer)
-            }
-
-            // 发送登录成功事件和 cookies
-            sendEvent('login_success', {
-              cookies: session.cookies,
-              message: 'Login successful'
-            })
-
-            // 关闭浏览器和连接
-            await session.browser.close()
-            sessions.delete(nonce)
-            controller.close()
-          }
-        }, 1000) // 每秒检查一次
-
-        // 5分钟超时
-        setTimeout(() => {
-          clearInterval(checkLogin)
-          if (sessions.has(nonce)) {
-            sendEvent('timeout', { message: 'Login timeout after 5 minutes' })
-            session.browser.close()
-            sessions.delete(nonce)
-          }
-          controller.close()
-        }, 300000) // 5分钟
-
-      }).catch((error) => {
-        console.error('Error initializing browser session:', error)
-        sendEvent('error', { error: 'Failed to initialize browser session' })
-        controller.close()
-      })
-    }
-  })
-
-  return new Response(stream)
-})
+  return c.json({
+    code: 1,
+    data: {
+      message: "Browser session closed successfully",
+    },
+    message: "Browser session closed successfully",
+  });
+});
 
 // 接口2: 查询 cookie 状态
 app.get("/cookies/:nonce", async (c) => {
@@ -257,7 +234,7 @@ app.get("/cookies/:nonce", async (c) => {
   if (session.timer) {
     clearTimeout(session.timer);
   }
-  await session.browser.close();
+  await session.browser.close(); // 只关闭context，不关闭browserInstance
   sessions.delete(nonce);
 
   return c.json({
