@@ -56,6 +56,8 @@ const sessions = new Map<
     cookies?: any[];
     isLoggedIn: boolean;
     timer?: NodeJS.Timeout;
+    captchaId?: string;
+    hasCaptcha?: boolean;
   }
 >();
 
@@ -97,6 +99,8 @@ async function initBrowserSession(nonce: string) {
     cookies: undefined as any[] | undefined,
     isLoggedIn: false,
     timer: undefined as NodeJS.Timeout | undefined,
+    captchaId: undefined as string | undefined,
+    hasCaptcha: false,
   };
 
   sessions.set(nonce, session);
@@ -118,6 +122,14 @@ async function initBrowserSession(nonce: string) {
           session.isLoggedIn = true;
           console.log(`User logged in for ${nonce}`);
         }
+      }
+      // /api/redcaptcha/v2/captcha/register
+      if (response.url().includes("/api/redcaptcha/v2/captcha/register")) {
+        const res = await response.json();
+        session.captchaId = res.data.captcha_id;
+        session.hasCaptcha = true;
+        session.isLoggedIn = false;
+        console.log(`Captcha detected for ${nonce}, captcha_id: ${res.data.captcha_id}`);
       }
     }
   });
@@ -161,11 +173,14 @@ app.get("/qrcode", async (c) => {
     }
 
     return c.json({
+      code: 1,
       data: {
         nonce,
         qrCodeUrl: session.qrCodeUrl,
+        hasCaptcha: session.hasCaptcha || false,
+        captchaId: session.captchaId,
       },
-      message: "Browser session initialized, will auto-close in 1 minute",
+      message: session.hasCaptcha ? "需要处理验证码" : "Browser session initialized, will auto-close in 1 minute",
     });
   } catch (error) {
     console.error("Error initializing browser session:", error);
@@ -220,11 +235,24 @@ app.get("/cookies/:nonce", async (c) => {
     }, 404);
   }
 
+  if (session.hasCaptcha) {
+    return c.json({
+      code: 0,
+      data: {
+        isLoggedIn: false,
+        hasCaptcha: true,
+        captchaId: session.captchaId,
+      },
+      message: "需要处理验证码，登录失败",
+    });
+  }
+
   if (!session.isLoggedIn) {
     return c.json({
       code: 0,
       data: {
         isLoggedIn: false,
+        hasCaptcha: false,
       },
       message: "User not logged in yet",
     });
@@ -335,6 +363,117 @@ app.get('/test', async (c) => {
 </body>
 </html>
   `)
+})
+
+// 接口1.1: SSE 长连接版本 - 获取二维码并等待登录
+app.get('/qrcode/stream', async (c) => {
+  const nonce = generateNonce()
+
+  // 设置 SSE 响应头
+  c.header('Content-Type', 'text/event-stream')
+  c.header('Cache-Control', 'no-cache')
+  c.header('Connection', 'keep-alive')
+  c.header('Access-Control-Allow-Origin', '*')
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder()
+
+      const sendEvent = (event: string, data: any) => {
+        const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+        controller.enqueue(encoder.encode(message))
+      }
+
+      // 初始化浏览器会话
+      initBrowserSession(nonce).then(async (session) => {
+        // 发送连接成功事件
+        sendEvent('connected', { nonce, message: 'Browser session initialized' })
+
+        // 等待二维码 URL
+        let attempts = 0
+        while (!session.qrCodeUrl && attempts < 50) {
+          await new Promise(resolve => setTimeout(resolve, 200))
+          attempts++
+        }
+
+        if (!session.qrCodeUrl) {
+          sendEvent('error', { error: 'Failed to get QR code URL' })
+          await session.browser.close()
+          sessions.delete(nonce)
+          controller.close()
+          return
+        }
+
+        // 发送二维码 URL
+        sendEvent('qrcode', { qrCodeUrl: session.qrCodeUrl })
+
+        // 监听登录状态变化
+        const checkLogin = setInterval(async () => {
+          // 检查是否出现验证码
+          if (session.hasCaptcha) {
+            clearInterval(checkLogin)
+            
+            // 清理定时器
+            if (session.timer) {
+              clearTimeout(session.timer)
+            }
+            
+            // 发送验证码事件
+            sendEvent('captcha', {
+              captchaId: session.captchaId,
+              message: '需要处理验证码，登录失败'
+            })
+            
+            // 关闭浏览器和连接
+            await session.browser.close()
+            sessions.delete(nonce)
+            controller.close()
+            return
+          }
+          
+          // 检查是否登录成功
+          if (session.isLoggedIn) {
+            clearInterval(checkLogin)
+
+            // 清理定时器
+            if (session.timer) {
+              clearTimeout(session.timer)
+            }
+
+            // 发送登录成功事件和 cookies
+            sendEvent('login_success', {
+              cookies: session.cookies,
+              message: 'Login successful'
+            })
+
+            // 关闭浏览器和连接
+            await session.browser.close()
+            sessions.delete(nonce)
+            controller.close()
+          }
+        }, 1000) // 每秒检查一次
+
+        // 5分钟超时
+        setTimeout(() => {
+          clearInterval(checkLogin)
+          if (sessions.has(nonce)) {
+            sendEvent('timeout', { message: 'Login timeout after 5 minutes' })
+            session.browser.close().then(() => {
+              sessions.delete(nonce)
+            })
+          }
+          controller.close()
+        }, 300000) // 5分钟
+
+      }).catch((error) => {
+        console.error('Error initializing browser session:', error)
+        sendEvent('error', { error: 'Failed to initialize browser session' })
+        controller.close()
+      })
+    }
+  })
+
+  return new Response(stream)
 })
 
 export default {
