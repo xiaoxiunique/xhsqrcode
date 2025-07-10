@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>小红书登录 - SSE 测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .connected { background-color: #d4edda; color: #155724; }
+        .error { background-color: #f8d7da; color: #721c24; }
+        .success { background-color: #d1ecf1; color: #0c5460; }
+        .qrcode img {
+            max-width: 300px;
+            border: 1px solid #ddd;
+            padding: 10px;
+        }
+        .cookies {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <h1>小红书登录 - SSE 长连接测试</h1>
+    
+    <button id="startBtn" onclick="startLogin()">开始登录</button>
+    <button id="stopBtn" onclick="stopLogin()" disabled>停止连接</button>
+    
+    <div id="status"></div>
+    <div id="qrcode"></div>
+    <div id="cookies"></div>
+
+    <script>
+        let eventSource = null;
+        
+        function addStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            const div = document.createElement('div');
+            div.className = `status ${type}`;
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            statusDiv.appendChild(div);
+            statusDiv.scrollTop = statusDiv.scrollHeight;
+        }
+        
+        function startLogin() {
+            if (eventSource) {
+                eventSource.close();
+            }
+            
+            // 清空之前的内容
+            document.getElementById('status').innerHTML = '';
+            document.getElementById('qrcode').innerHTML = '';
+            document.getElementById('cookies').innerHTML = '';
+            
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            
+            addStatus('正在连接服务器...', 'connected');
+            
+            eventSource = new EventSource('http://localhost:3000/qrcode/stream');
+            
+            eventSource.addEventListener('connected', function(e) {
+                const data = JSON.parse(e.data);
+                addStatus(`连接成功! Session ID: ${data.nonce}`, 'connected');
+            });
+            
+            eventSource.addEventListener('qrcode', function(e) {
+                const data = JSON.parse(e.data);
+                addStatus('收到二维码，请扫码登录', 'success');
+                
+                const qrcodeDiv = document.getElementById('qrcode');
+                qrcodeDiv.innerHTML = `
+                    <h3>请扫描二维码登录：</h3>
+                    <div class="qrcode">
+                        <img src="${data.qrCodeUrl}" alt="登录二维码" />
+                    </div>
+                    <p>等待用户扫码登录...</p>
+                `;
+            });
+            
+            eventSource.addEventListener('login_success', function(e) {
+                const data = JSON.parse(e.data);
+                addStatus('登录成功！已获取到 cookies', 'success');
+                
+                const cookiesDiv = document.getElementById('cookies');
+                cookiesDiv.innerHTML = `
+                    <h3>登录成功，获取到的 Cookies：</h3>
+                    <div class="cookies">${JSON.stringify(data.cookies, null, 2)}</div>
+                `;
+                
+                stopLogin();
+            });
+            
+            eventSource.addEventListener('error', function(e) {
+                const data = JSON.parse(e.data);
+                addStatus(`错误: ${data.error}`, 'error');
+                stopLogin();
+            });
+            
+            eventSource.addEventListener('timeout', function(e) {
+                const data = JSON.parse(e.data);
+                addStatus(`超时: ${data.message}`, 'error');
+                stopLogin();
+            });
+            
+            eventSource.onerror = function(e) {
+                addStatus('连接错误，请检查服务器是否运行', 'error');
+                stopLogin();
+            };
+        }
+        
+        function stopLogin() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            
+            addStatus('连接已关闭', 'connected');
+        }
+    </script>
+</body>
+</html>
