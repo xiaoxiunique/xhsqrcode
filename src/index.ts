@@ -11,7 +11,7 @@ let globalBrowserInstance: Browser | null = null;
 async function initGlobalBrowser() {
   if (!globalBrowserInstance) {
     globalBrowserInstance = await chromium.launch({
-      headless: false,
+      headless: true,
       devtools: false,
       args: [
         "--disable-web-security",
